@@ -1,21 +1,11 @@
-# Copyright (C) 2023 ByteDance. All Rights Reserved.
-#
-# This software is released under the MIT License.
-# https://opensource.org/licenses/MIT
-
-"""
-A script to show an example of how to unlearn harmfulness.
-
-The dataset used in is `PKU-SafeRLHF`. Model support OPT-1.3B, OPT-2.7B, and Llama 2 (7B).
-"""
 import argparse
 import logging
 import random
 import time
-
+import matplotlib.pyplot as plt
 import numpy as np
+import gc
 import torch
-from accelerate import Accelerator
 from datasets import load_dataset
 from peft import AdaLoraConfig, TaskType, get_peft_model
 from torch.optim import AdamW
@@ -35,17 +25,11 @@ random.seed(8888)
 
 
 def main(args) -> None:
-    accelerator = Accelerator(mixed_precision="bf16")
-    device = accelerator.device
-    
-    print('#########')
-    accelerator.print(f'device {str(accelerator.device)} is used!')
-    print('#########')
-    
     print('💽 Loading model and tokenizer...')
     print('model name: ', args.model_name)
-    
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
+    device = 'cpu'
+    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    # model = LlamaForCausalLM.from_pretrained()
     
     # If use LoRA.
     if args.use_lora:
@@ -58,36 +42,26 @@ def main(args) -> None:
         )
         model = get_peft_model(model, peft_config)
 
-    model.to(device)
+    # model.to(device) # 不再需要将模型移动到设备上
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    # Load harmful data.
-    # train_dataset = load_dataset("PKU-Alignment/PKU-SafeRLHF", split="330k_train")
-    
     print('💽 Loading harmful data...')    
     
-    # train_dataset = load_dataset("PKU-Alignment/PKU-SafeRLHF", split="train[:100000]")
     train_dataset = load_dataset("PKU-Alignment/PKU-SafeRLHF", split="train")
-    # print(train_dataset[0])
-    # train_dataset = train_dataset.map(lambda example: {"prompt": example["prompt"][:120]})
-
     train_bad_loader = create_pku_dataloader_from_dataset(
         tokenizer, train_dataset, batch_size=args.batch_size
     )
     
-    print('💽 Loading normal data...')
+    print('💽 Loading normal data...')    
 
-    # Get normal data.
     train_normal_loader, _, _ = create_truthfulqa_dataloader(
         tokenizer, batch_size=args.batch_size
     )
 
-    # Load normal answer used for random mismatch.
     normal_ans = get_truthfulQA_answers_plaintext()
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    # Prepare.
     num_training_steps = args.max_unlearn_steps
     lr_scheduler = get_scheduler(
         name="linear",
@@ -96,56 +70,38 @@ def main(args) -> None:
         num_training_steps=num_training_steps,
     )
 
-    (
-        model,
-        optimizer,
-        train_bad_loader,
-        train_normal_loader,
-        lr_scheduler,
-    ) = accelerator.prepare(
-        model, optimizer, train_bad_loader, train_normal_loader, lr_scheduler
-    )
-
     print('🚀 Model training...')    
 
     model.train()
 
     # Reference model for computing KL.
     pretrained_model = AutoModelForCausalLM.from_pretrained(args.model_name)
-    pretrained_model.to(device)
-
-    # Start unlearning.
+    
     bad_loss = 0.0
     idx = 0
     start_time = time.time()
     
-    # Record 3 kinds of loss
     loss_history = {
         "bad_loss": [],
         "random_loss": [],
         "normal_loss": []
     }
     
-    # Stop if bad loss is big enough or reaching max step.
     while bad_loss < args.max_bad_loss and idx < args.max_unlearn_steps:
         for bad_batch, normal_batch in zip(train_bad_loader, train_normal_loader):
-            ############ GA on answer only. ############
-            bad_loss = get_answer_loss("ga", bad_batch, model, device=device)
+            bad_loss = get_answer_loss("ga", bad_batch, model, device=device) # 不再传入device参数
 
-            ############ Random mismatch. ############
             random_loss = get_rand_ans_loss(
                 bad_batch,
                 tokenizer,
                 normal_ans,
                 model,
                 K=5,
-                device=device,
+                device=device
             )
             
-            ############ KL on normal samples. ############
             normal_loss = compute_kl(pretrained_model, model, normal_batch, device=device)
 
-            # Final loss = bad loss + random smoothing + normal loss.
             loss = (
                 args.bad_weight * bad_loss
                 + args.random_weight * random_loss
@@ -156,13 +112,11 @@ def main(args) -> None:
             loss_history["random_loss"].append(random_loss.item())
             loss_history["normal_loss"].append(normal_loss.item())
 
-            # Backprop.
-            accelerator.backward(loss)
+            optimizer.zero_grad()
+            loss.backward()
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad()
-            
-            # Print.
+
             stats = (
                 f"batch: {idx}, "
                 f"bad_loss: {-bad_loss:.2f}, "
@@ -173,11 +127,21 @@ def main(args) -> None:
             print(stats)
             idx += 1
 
-            # Save model.
             if idx % args.save_every == 0:
-                model.save_pretrained(args.model_save_dir, from_pt=True)
+            # if idx == 200 or idx == 500 or idx == 1000:
+                model.save_pretrained(args.model_save_dir + f'_step{idx}', from_pt=True)
                 print('📁 Archive model')
                 
+                plt.figure(figsize=(10, 6))
+                plt.plot(loss_history["bad_loss"], label="Loss on Unlearned Samples")
+                plt.plot(loss_history["random_loss"], label="Random Mismatch Loss")
+                plt.plot(loss_history["normal_loss"], label="Loss on Normal Samples")
+                plt.xlabel("Batch")
+                plt.ylabel("Loss")
+                plt.title("Loss Curves During Training")
+                plt.legend()
+                plt.savefig(f'result/1.3b-loss_curves_opt_steps{idx}.png')
+            
             if idx >= args.max_unlearn_steps or bad_loss >= args.max_bad_loss:
                 break
     end_time = time.time()
@@ -186,22 +150,20 @@ def main(args) -> None:
     if args.use_lora:
         model = model.merge_and_unload()
 
-    # Save final model.
-    model.save_pretrained(args.model_save_dir, from_pt=True)
+    # model.save_pretrained(args.model_save_dir, from_pt=True)
     logging.info("Unlearning finished")
 
     print("🚀 Unlearning Process Finished!")
 
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(10, 6))
-    plt.plot(loss_history["bad_loss"], label="Loss on Unlearned Samples")
-    plt.plot(loss_history["random_loss"], label="Random Mismatch Loss")
-    plt.plot(loss_history["normal_loss"], label="Loss on Normal Samples")
-    plt.xlabel("Batch")
-    plt.ylabel("Loss")
-    plt.title("Loss Curves During Training")
-    plt.legend()
-    plt.savefig("result/loss_curves.png")
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(loss_history["bad_loss"], label="Loss on Unlearned Samples")
+    # plt.plot(loss_history["random_loss"], label="Random Mismatch Loss")
+    # plt.plot(loss_history["normal_loss"], label="Loss on Normal Samples")
+    # plt.xlabel("Batch")
+    # plt.ylabel("Loss")
+    # plt.title("Loss Curves During Training")
+    # plt.legend()
+    # plt.savefig("result/1.3b-loss_curves_opt.png")
 
     return
 
@@ -236,7 +198,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", type=int, default=2, help="Batch size of unlearning."
     )
-    parser.add_argument("--lr", type=float, default=2e-6, help="Unlearning LR.")
+    parser.add_argument(
+        "--lr", type=float, default=1e-6, help="Unlearning LR."
+    )
     parser.add_argument(
         "--max_bad_loss",
         type=float,
